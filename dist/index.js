@@ -150,6 +150,7 @@ export default Plugin.define({
                         const state = stateFor(event.data.sessionID);
                         state.executing = false;
                         state.ownPrompt = false;
+                        schedule(event.data.sessionID);
                         continue;
                     }
                     if (event.type === "session.execution.interrupted") {

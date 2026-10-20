@@ -185,6 +185,7 @@ export default Plugin.define({
             const state = stateFor(event.data.sessionID);
             state.executing = false;
             state.ownPrompt = false;
+            schedule(event.data.sessionID);
             continue;
           }
 
