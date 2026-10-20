@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { Plugin } from "@opencode/plugin";
 
 const CONFIG_FILE = "opencode-auto-continue.jsonc";
+const MAX_FAILURES = 3;
 
 interface Config {
   enabled: boolean;
@@ -25,7 +26,9 @@ interface SessionState {
   ownPrompt: boolean;
   seenExecution: boolean;
   consecutive: number;
+  failures: number;
   lastContinue: number;
+  skipScheduleUntil: number;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -78,12 +81,13 @@ async function loadConfig(directory: string): Promise<Config> {
   try {
     const raw = await readFile(join(directory, ".opencode", CONFIG_FILE), "utf-8");
     const parsed = JSON.parse(stripJsonc(raw)) as Partial<Config>;
+    const amount = (value: unknown, fallback: number) =>
+      typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : fallback;
     return {
       enabled: typeof parsed.enabled === "boolean" ? parsed.enabled : DEFAULTS.enabled,
-      delayMs: typeof parsed.delayMs === "number" ? parsed.delayMs : DEFAULTS.delayMs,
-      throttleMs: typeof parsed.throttleMs === "number" ? parsed.throttleMs : DEFAULTS.throttleMs,
-      maxConsecutive:
-        typeof parsed.maxConsecutive === "number" ? parsed.maxConsecutive : DEFAULTS.maxConsecutive,
+      delayMs: amount(parsed.delayMs, DEFAULTS.delayMs),
+      throttleMs: amount(parsed.throttleMs, DEFAULTS.throttleMs),
+      maxConsecutive: Math.floor(amount(parsed.maxConsecutive, DEFAULTS.maxConsecutive)),
     };
   } catch {
     return { ...DEFAULTS };
@@ -108,7 +112,9 @@ export default Plugin.define({
           ownPrompt: false,
           seenExecution: false,
           consecutive: 0,
+          failures: 0,
           lastContinue: 0,
+          skipScheduleUntil: 0,
         };
         sessions.set(sessionID, state);
       }
@@ -127,6 +133,7 @@ export default Plugin.define({
       state.timer = undefined;
 
       if (!state.enabled || state.suspended || state.executing || !state.seenExecution) return;
+      if (Date.now() < state.skipScheduleUntil) return;
       if (config.maxConsecutive > 0 && state.consecutive >= config.maxConsecutive) return;
       if (Date.now() - state.lastContinue < config.throttleMs) return;
 
@@ -141,17 +148,26 @@ export default Plugin.define({
       state.consecutive += 1;
       state.lastContinue = Date.now();
       state.ownPrompt = true;
+      state.executing = true;
 
       try {
         await ctx.session.prompt({ sessionID, text: "continue" });
       } catch {
         state.ownPrompt = false;
+        state.executing = false;
       }
     };
 
     const schedule = (sessionID: string) => {
       const state = stateFor(sessionID);
-      if (!state.enabled || state.suspended || state.executing || state.timer || !state.seenExecution) {
+      if (
+        !state.enabled ||
+        state.suspended ||
+        state.executing ||
+        state.timer ||
+        !state.seenExecution ||
+        Date.now() < state.skipScheduleUntil
+      ) {
         return;
       }
       state.timer = setTimeout(() => void resume(sessionID), config.delayMs);
@@ -173,9 +189,10 @@ export default Plugin.define({
             state.seenExecution = true;
             state.executing = true;
 
-            if (!state.ownPrompt) {
+            if (!state.ownPrompt && Date.now() >= state.skipScheduleUntil) {
               state.suspended = false;
               state.consecutive = 0;
+              state.failures = 0;
             }
             state.ownPrompt = false;
             continue;
@@ -183,9 +200,15 @@ export default Plugin.define({
 
           if (event.type === "session.execution.succeeded" || event.type === "session.execution.failed") {
             const state = stateFor(event.data.sessionID);
+            const afterCommand = Date.now() < state.skipScheduleUntil;
+            state.skipScheduleUntil = 0;
             state.executing = false;
             state.ownPrompt = false;
-            schedule(event.data.sessionID);
+            state.failures =
+              event.type === "session.execution.failed" ? state.failures + 1 : 0;
+            if (!afterCommand && state.failures < MAX_FAILURES) {
+              schedule(event.data.sessionID);
+            }
             continue;
           }
 
@@ -206,6 +229,8 @@ export default Plugin.define({
 
     const runCommand = async ({ sessionID, prompt }: { sessionID: string; prompt: { text: string } }) => {
       const state = stateFor(sessionID);
+      // The command output itself is a synthetic turn; it must not trigger a continue.
+      state.skipScheduleUntil = Date.now() + 60_000;
       const raw = prompt.text
         .trim()
         .replace(/^\/(?:auto-continue|ac)\b/i, "")
@@ -251,6 +276,9 @@ export default Plugin.define({
       editor.add({ name: "auto-continue", description, execute: runCommand });
     });
 
-    return () => controller.abort();
+    return () => {
+      for (const state of sessions.values()) cancel(state);
+      controller.abort();
+    };
   },
 });

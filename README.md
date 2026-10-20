@@ -4,10 +4,10 @@ OpenCode 2 plugin that sends `continue` when a session goes idle, so work resume
 
 ## How It Works
 
-1. Listens for `session.idle`
+1. Watches for an execution to finish (`session.execution.succeeded` or `session.execution.failed`)
 2. Waits `delayMs` so a queued user prompt can start first
 3. Sends `continue` to the session
-4. Repeats when the session goes idle again
+4. Repeats when the next execution finishes
 
 The plugin stays out of the way when:
 
@@ -15,6 +15,8 @@ The plugin stays out of the way when:
 - a permission request is waiting for an answer
 - the session is a child session created by a subagent
 - the consecutive limit or throttle is reached
+- three executions in a row have failed — it stops instead of retrying a broken provider
+- the turn came from a `/ac` command rather than the agent
 
 ## Installation
 
